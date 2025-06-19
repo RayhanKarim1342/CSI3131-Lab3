@@ -1,4 +1,3 @@
-import java.util.Random;
 import java.util.concurrent.Semaphore;
 
 public class Lab3 {
@@ -10,7 +9,6 @@ public class Lab3 {
     final int NUM_CARS = 10;
 
     Ferry fer = new Ferry(PORT0, 10);
-
     Auto[] automobile = new Auto[NUM_CARS];
     for (int i = 0; i < 7; i++) {
       automobile[i] = new Auto(i, PORT0, fer);
@@ -21,18 +19,18 @@ public class Lab3 {
 
     Ambulance ambulance = new Ambulance(PORT0, fer);
 
-    fer.start(); // Start ferry thread
+    fer.start();
     for (int i = 0; i < NUM_CARS; i++) {
-      automobile[i].start(); // Start automobile threads
+      automobile[i].start();
     }
-    ambulance.start(); // Start ambulance thread
+    ambulance.start();
 
     try {
-      fer.join();
+      fer.join(); // wait for ferry to finish its crossings
     } catch (InterruptedException e) {
     }
 
-    System.out.println("Ferry stopped.");
+    // Interrupt all threads
     for (int i = 0; i < NUM_CARS; i++) {
       automobile[i].interrupt();
     }
@@ -40,6 +38,7 @@ public class Lab3 {
   }
 }
 
+// Auto Thread
 class Auto extends Thread {
   private int id_auto;
   private int port;
@@ -52,43 +51,36 @@ class Auto extends Thread {
   }
 
   public void run() {
-    while (true) {
+    while (!isInterrupted() && fry.isRunning()) {
       try {
         sleep((int) (300 * Math.random()));
-        System.out.println("Auto " + id_auto + " arrives at port " + port);
-        boolean boarded = false;
-        while (!boarded) {
-          if (fry.getPort() == port && !fry.isUnloading()) {
-            if (fry.canBoard.tryAcquire()) {
-              System.out.println("Auto " + id_auto + " boards on the ferry at port " + port);
-              fry.addLoad(false);
-              boarded = true;
-            } else {
-              sleep(50); // no permit yet
-            }
-          } else {
-            sleep(50); // ferry not ready
-          }
-        }
-
-        sleep(100); // simulate travel
-        port = 1 - port;
-
-        fry.canDisembark.acquire();
-        System.out.println("Auto " + id_auto + " disembarks from ferry at port " + port);
-        fry.reduceLoad();
-
-        if (isInterrupted())
-          break;
-
       } catch (InterruptedException e) {
         break;
       }
+
+      if (!fry.isRunning())
+        break;
+
+      System.out.println("Auto " + id_auto + " arrives at port " + port);
+      fry.boardAuto(port);
+
+      if (!fry.isRunning() || isInterrupted())
+        break;
+
+      System.out.println("Auto " + id_auto + " boards on the ferry at port " + port);
+      fry.addLoad();
+
+      fry.waitForArrival();
+
+      port = 1 - port;
+      System.out.println("Auto " + id_auto + " disembarks from ferry at port " + port);
+      fry.reduceLoad();
     }
     System.out.println("Auto " + id_auto + " terminated");
   }
 }
 
+// Ambulance Thread
 class Ambulance extends Thread {
   private int port;
   private Ferry fry;
@@ -99,59 +91,48 @@ class Ambulance extends Thread {
   }
 
   public void run() {
-    while (true) {
+    while (!isInterrupted() && fry.isRunning()) {
       try {
         sleep((int) (1000 * Math.random()));
-        System.out.println("Ambulance arrives at port " + port);
-
-        boolean boarded = false;
-        while (!boarded) {
-          if (fry.getPort() == port && !fry.isUnloading()) {
-            if (fry.canBoard.tryAcquire()) {
-              System.out.println("Ambulance boards the ferry at port " + port);
-              fry.addLoad(true);
-              boarded = true;
-            } else {
-              sleep(50);
-            }
-          } else {
-            sleep(50);
-          }
-        }
-
-        sleep(100); // simulate travel
-        port = 1 - port;
-
-        fry.canDisembark.acquire();
-        System.out.println("Ambulance disembarks from ferry at port " + port);
-        fry.reduceLoad();
-
-        if (isInterrupted())
-          break;
-
       } catch (InterruptedException e) {
         break;
       }
+
+      if (!fry.isRunning())
+        break;
+
+      System.out.println("Ambulance arrives at port " + port);
+      fry.boardAmbulance(port);
+
+      if (!fry.isRunning() || isInterrupted())
+        break;
+
+      System.out.println("Ambulance boards the ferry at port " + port);
+      fry.addLoad();
+
+      fry.waitForArrival();
+
+      port = 1 - port;
+      System.out.println("Ambulance disembarks the ferry at port " + port);
+      fry.reduceLoad();
     }
     System.out.println("Ambulance terminates.");
   }
 }
 
+// Ferry Thread
 class Ferry extends Thread {
   private int port;
   private int load = 0;
   private int numCrossings;
+  private volatile boolean running = true;
 
-  final static int MAXLOAD = 5;
+  private final Semaphore[] canBoard = { new Semaphore(0), new Semaphore(0) };
+  private final Semaphore ferryReady = new Semaphore(0);
+  private final Semaphore mutex = new Semaphore(1);
 
-  Semaphore mutex = new Semaphore(1);
-  Semaphore canBoard = new Semaphore(0);
-  Semaphore canDisembark = new Semaphore(0);
-  Semaphore ferryReady = new Semaphore(0);
-  Semaphore crossing = new Semaphore(0);
-
-  private boolean unloading = false;
-  private boolean ambulanceBoarded = false;
+  private volatile boolean ambulanceOnBoard = false;
+  private volatile boolean disembarking = false;
 
   public Ferry(int prt, int nbtours) {
     this.port = prt;
@@ -162,55 +143,114 @@ class Ferry extends Thread {
     System.out.println("Start at port " + port + " with a load of " + load + " vehicles");
 
     for (int i = 0; i < numCrossings; i++) {
+      allowBoarding();
+
+      while (true) {
+        try {
+          Thread.sleep(50);
+          mutex.acquire();
+          if (load == Lab3.MAXLOAD || ambulanceOnBoard) {
+            mutex.release();
+            break;
+          }
+          mutex.release();
+        } catch (InterruptedException e) {
+          return;
+        }
+      }
+
       try {
-        // Disembark phase
         mutex.acquire();
-        unloading = true;
-        mutex.release();
-
-        canDisembark.release(MAXLOAD);
-        Thread.sleep(100); // give time for disembarking
-
-        mutex.acquire();
-        load = 0;
-        unloading = false;
-        mutex.release();
-
-        // Boarding phase
-        canBoard.release(MAXLOAD);
-
-        // Wait for ferry to be full or ambulance to board
-        ferryReady.acquire();
-
         System.out.println("Departure from port " + port + " with a load of " + load + " vehicles");
-        Thread.sleep(100); // simulate travel
-        port = 1 - port;
-        System.out.println("Arrive at port " + port + " with a load of " + load + " vehicles");
-
+        System.out.println("Crossing " + i + " with a load of " + load + " vehicles");
+        mutex.release();
       } catch (InterruptedException e) {
-        break;
+      }
+
+      disembarking = true;
+      port = 1 - port;
+
+      try {
+        Thread.sleep((int) (100 * Math.random()));
+      } catch (InterruptedException e) {
+      }
+
+      System.out.println("Ferry Arrives at port " + port + " with a load of " + load + " vehicles");
+
+      ferryReady.release(load); // allow disembark
+
+      while (true) {
+        try {
+          mutex.acquire();
+          if (load == 0) {
+            disembarking = false;
+            ambulanceOnBoard = false;
+            mutex.release();
+            break;
+          }
+          mutex.release();
+          Thread.sleep(20);
+        } catch (InterruptedException e) {
+          return;
+        }
+      }
+    }
+
+    running = false; // signal shutdown
+    System.out.println("Ferry stopped.");
+  }
+
+  private void allowBoarding() {
+    canBoard[port].release(10);
+  }
+
+  public void boardAuto(int p) {
+    while (running) {
+      try {
+        canBoard[p].acquire();
+        mutex.acquire();
+        if (port == p && !disembarking && load < Lab3.MAXLOAD && !ambulanceOnBoard) {
+          mutex.release();
+          return;
+        }
+        mutex.release();
+        Thread.sleep(30);
+      } catch (InterruptedException e) {
+        return;
       }
     }
   }
 
-  public int getPort() {
-    return port;
+  public void boardAmbulance(int p) {
+    while (running) {
+      try {
+        canBoard[p].acquire();
+        mutex.acquire();
+        if (port == p && !disembarking && load < Lab3.MAXLOAD) {
+          ambulanceOnBoard = true;
+          mutex.release();
+          return;
+        }
+        mutex.release();
+        Thread.sleep(30);
+      } catch (InterruptedException e) {
+        return;
+      }
+    }
   }
 
-  public boolean isUnloading() {
-    return unloading;
+  public void waitForArrival() {
+    try {
+      ferryReady.acquire();
+    } catch (InterruptedException e) {
+      return;
+    }
   }
 
-  public void addLoad(boolean isAmbulance) {
+  public void addLoad() {
     try {
       mutex.acquire();
       load++;
-      if (isAmbulance) {
-        ambulanceBoarded = true;
-        ferryReady.release(); // leave immediately
-      } else if (load == MAXLOAD) {
-        ferryReady.release(); // leave if full
-      }
       mutex.release();
     } catch (InterruptedException e) {
     }
@@ -220,11 +260,12 @@ class Ferry extends Thread {
     try {
       mutex.acquire();
       load--;
-      if (load == 0 && ambulanceBoarded) {
-        ambulanceBoarded = false;
-      }
       mutex.release();
     } catch (InterruptedException e) {
     }
+  }
+
+  public boolean isRunning() {
+    return running;
   }
 }
